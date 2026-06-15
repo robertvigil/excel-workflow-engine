@@ -1,0 +1,1117 @@
+/**
+ * Process Workflow
+ *
+ * The script reads the sheet once, runs the uniqueness gate, then dispatches
+ * on the "Action" config property:
+ *   - Organize — reflow the table into an indented outline.
+ *   - Publish  — compile the definition into a formatted checklist sheet.
+ * On a completely empty sheet it instead lays down a starter workflow — a
+ * self-documenting guide written as a workflow (config block + step table).
+ * The gate (ensureUniqueWorkflowSteps) always runs first.
+ */
+function main(workbook: ExcelScript.Workbook) {
+  const sheet = workbook.getActiveWorksheet();
+
+  const used = sheet.getUsedRange();
+  if (!used) {
+    scaffoldStarterSheet(sheet); // brand-new sheet -> lay down the starter guide
+    return;
+  }
+
+  // Read the whole grid once (one server round-trip); every stage works from
+  // this in-memory snapshot rather than re-reading the workbook.
+  const values = used.getValues();
+  const topRow = used.getRowIndex();
+  const leftCol = used.getColumnIndex();
+  const geom = locateStepTable(values);
+
+  // Self-healing UI upkeep (independent of workflow validity): keep the Action
+  // cell's dropdown in place and seed its default, and turn each sheet-naming config
+  // value ("Linked Sheet" rows, "Published Sheet") into a clickable hyperlink to that
+  // sheet when it exists. Both run even if the gate fails.
+  ensureActionDropdown(sheet, values, topRow, leftCol, geom);
+  linkSheetReferences(workbook, sheet, values, topRow, leftCol, geom);
+
+  // Precondition gate: unique step names are required before any action runs — across
+  // this sheet and any "Linked Sheet" it names. If it throws, the script stops here.
+  ensureUniqueWorkflowSteps(workbook, sheet, values, topRow, geom);
+
+  // Dispatch on the "Action" config property (defaults to Organize when blank).
+  const requested = readAction(values, geom);
+  const action = requested === "" ? ACTION_ORGANIZE : normalize(requested);
+  switch (action) {
+    case ACTION_ORGANIZE:
+      organizeWorkflow(sheet, values, topRow, leftCol, geom);
+      break;
+    case ACTION_PUBLISH:
+      publishWorkflow(workbook, sheet, values, topRow, leftCol, geom);
+      break;
+    case ACTION_RENUMBER:
+      renumberWorkflow(sheet, values, topRow, leftCol, geom);
+      break;
+    case ACTION_UNNUMBER:
+      unnumberWorkflow(sheet, values, topRow, leftCol, geom);
+      break;
+    default:
+      throw new Error(
+        `Unknown action "${requested}". Expected one of: ${ACTION_OPTIONS.join(", ")}.`
+      );
+  }
+}
+
+/** Header text that marks the start of the step table. */
+const STEP_HEADER = "Workflow Step";
+/** Header text for the parent-pointer column. */
+const PARENT_HEADER = "Parent Step";
+/** Header text for the completion-checkbox column. */
+const DONE_HEADER = "Done";
+/** Header text for the notes column. */
+const NOTES_HEADER = "Notes";
+/** Header text for the (optional) outline-number column written by Renumber. */
+const NUMBER_HEADER = "No.";
+/**
+ * Header text for the (optional) display-label column. A Publish-only override: when a
+ * row has a non-blank "Label", the published checklist shows it in place of the
+ * "Workflow Step" name — so the source keeps its unique (and possibly messy) step names
+ * while the published sheet reads cleanly. Folded into the Step column, never published
+ * as its own column. Has no effect on Organize/Renumber or the uniqueness gate.
+ */
+const LABEL_HEADER = "Label";
+/** Config property naming the sheet that Publish creates (re-created each run). */
+const PUBLISHED_SHEET_LABEL = "Published Sheet";
+/** Config property holding the workflow's name (used as the published sheet title; falls back to the sheet name). */
+const WORKFLOW_NAME_LABEL = "Workflow Name";
+/**
+ * Config property naming another sheet whose steps share this sheet's uniqueness
+ * namespace. Repeatable — one sheet per row — so a workflow can be split across several
+ * sheets (e.g. a main sheet plus checked-out branches) while step names stay unique
+ * across all of them, so the pieces can be pasted back together and Organized cleanly.
+ */
+const LINKED_SHEET_LABEL = "Linked Sheet";
+
+/** Config property (column-A label) whose value selects what the script does. */
+const ACTION_LABEL = "Action";
+/** Recognized actions (normalized). Organize is the default when the cell is blank. */
+const ACTION_ORGANIZE = "organize";
+const ACTION_PUBLISH = "publish";
+const ACTION_RENUMBER = "renumber";
+const ACTION_UNNUMBER = "un-number";
+/**
+ * Display labels for the self-healing Action dropdown. The first entry is the
+ * seeded default. Keep these words in sync with the ACTION_* keys above (each label
+ * must normalize() to its key).
+ */
+const ACTION_OPTIONS = ["Organize", "Publish", "Renumber", "Un-number"];
+
+/** Excel indent levels applied per tree depth when organizing the outline. */
+const INDENT_PER_LEVEL = 2;
+
+/**
+ * Normalize a name for comparison.
+ *
+ * IMPORTANT: this is the single source of truth for "are two names the same".
+ * Uniqueness checking AND parent-to-step matching both go through here, so they
+ * can never disagree. Change the rule here and both stages change together.
+ */
+function normalize(name: string): string {
+  return name.trim().toLowerCase();
+}
+
+/** Geometry of the step table within a used-range values grid (indices are range-relative). */
+interface TableGeom {
+  headerRow: number; // row index (within values) of the header row
+  stepCol: number;   // column index of "Workflow Step" — the table's first column
+  parentCol: number; // column index of "Workflow Parent", or -1 if absent
+  width: number;     // contiguous non-empty header columns starting at stepCol
+}
+
+/** Locate the step table by its header row. Throws if the Step header is missing. */
+function locateStepTable(values: (string | number | boolean)[][]): TableGeom {
+  const geom = tryLocateStepTable(values);
+  if (!geom) {
+    throw new Error(`Could not find a "${STEP_HEADER}" column header on this sheet.`);
+  }
+  return geom;
+}
+
+/** Locate the step table by its header row. Returns null if the Step header is missing. */
+function tryLocateStepTable(values: (string | number | boolean)[][]): TableGeom | null {
+  let headerRow = -1;
+  let stepCol = -1;
+  for (let r = 0; r < values.length && headerRow === -1; r++) {
+    for (let c = 0; c < values[r].length; c++) {
+      if (normalize(String(values[r][c])) === normalize(STEP_HEADER)) {
+        headerRow = r;
+        stepCol = c;
+        break;
+      }
+    }
+  }
+  if (headerRow === -1) {
+    return null;
+  }
+
+  // Table spans the contiguous run of non-empty headers starting at the Step column.
+  let width = 0;
+  for (let c = stepCol; c < values[headerRow].length; c++) {
+    if (String(values[headerRow][c]).trim() === "") break;
+    width++;
+  }
+
+  let parentCol = -1;
+  for (let c = 0; c < values[headerRow].length; c++) {
+    if (normalize(String(values[headerRow][c])) === normalize(PARENT_HEADER)) {
+      parentCol = c;
+      break;
+    }
+  }
+
+  return { headerRow, stepCol, parentCol, width };
+}
+
+/** Find a column index (within the values grid) by its header text. -1 if absent. */
+function findColumnIndex(
+  values: (string | number | boolean)[][],
+  headerRow: number,
+  header: string
+): number {
+  const row = values[headerRow];
+  for (let c = 0; c < row.length; c++) {
+    if (normalize(String(row[c])) === normalize(header)) {
+      return c;
+    }
+  }
+  return -1;
+}
+
+/**
+ * Locate the "Action" property's value cell — the cell to the right of the
+ * "Action" label, searched within the config block above the step table.
+ * Anchored on the label, not a fixed cell, so the config block can move.
+ * Indices are relative to the values grid. Returns null if the property is absent.
+ */
+function locateActionValueCell(
+  values: (string | number | boolean)[][],
+  geom: TableGeom
+): { row: number; col: number } | null {
+  for (let r = 0; r < geom.headerRow; r++) {
+    for (let c = 0; c + 1 < values[r].length; c++) {
+      if (normalize(String(values[r][c])) === normalize(ACTION_LABEL)) {
+        return { row: r, col: c + 1 };
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * Read the requested action. Returns "" (caller then defaults to Organize) when
+ * the Action property is absent or blank.
+ */
+function readAction(values: (string | number | boolean)[][], geom: TableGeom): string {
+  const cell = locateActionValueCell(values, geom);
+  if (!cell) {
+    return "";
+  }
+  return String(values[cell.row][cell.col] ?? "").trim();
+}
+
+/**
+ * Self-healing UI: turn config values that NAME a worksheet into clickable in-workbook
+ * hyperlinks to that sheet — every "Linked Sheet" row and the "Published Sheet" value —
+ * so the user can jump straight to a linked branch or the generated checklist. Like the
+ * Action dropdown this is cosmetic upkeep re-applied every run: it writes only a hyperlink
+ * onto the value cell and keeps the cell's TEXT identical (textToDisplay = the name), so
+ * the value the engine reads later is unchanged.
+ *
+ * A name that resolves to no sheet is left untouched (never a hard error here): a missing
+ * "Linked Sheet" is the uniqueness gate's error to report, and a "Published Sheet" that
+ * hasn't been published yet simply isn't a link until the run that creates it.
+ */
+function linkSheetReferences(
+  workbook: ExcelScript.Workbook,
+  sheet: ExcelScript.Worksheet,
+  values: (string | number | boolean)[][],
+  topRow: number,
+  leftCol: number,
+  geom: TableGeom
+): void {
+  const linkable = [normalize(LINKED_SHEET_LABEL), normalize(PUBLISHED_SHEET_LABEL)];
+  for (let r = 0; r < geom.headerRow; r++) {
+    for (let c = 0; c + 1 < values[r].length; c++) {
+      if (linkable.indexOf(normalize(String(values[r][c]))) === -1) {
+        continue;
+      }
+      const name = String(values[r][c + 1] ?? "").trim();
+      const target = name === "" ? undefined : workbook.getWorksheet(name);
+      if (target) {
+        // Internal link "'<sheet>'!A1" — sheet name single-quoted, apostrophes doubled.
+        const ref = `'${target.getName().replace(/'/g, "''")}'!A1`;
+        sheet
+          .getRangeByIndexes(topRow + r, leftCol + c + 1, 1, 1)
+          .setHyperlink({ documentReference: ref, textToDisplay: name, screenTip: `Go to ${name}` });
+      }
+      break; // one value per row; move to the next row
+    }
+  }
+}
+
+/** Apply the Action in-cell dropdown (list validation) to a cell, reset from scratch. */
+function applyActionDropdown(range: ExcelScript.Range): void {
+  const validation = range.getDataValidation();
+  validation.clear();
+  validation.setRule({
+    list: { inCellDropDown: true, source: ACTION_OPTIONS.join(",") },
+  });
+}
+
+/**
+ * Self-healing dropdown: (re)apply the in-cell list validation to the Action
+ * value cell every run, and seed the default if it's empty. No-op when the
+ * sheet has no Action property to attach to.
+ */
+function ensureActionDropdown(
+  sheet: ExcelScript.Worksheet,
+  values: (string | number | boolean)[][],
+  topRow: number,
+  leftCol: number,
+  geom: TableGeom
+): void {
+  const cell = locateActionValueCell(values, geom);
+  if (!cell) {
+    return;
+  }
+
+  const range = sheet.getRangeByIndexes(topRow + cell.row, leftCol + cell.col, 1, 1);
+  applyActionDropdown(range); // re-apply from scratch each run so it can't drift
+
+  // Seed the default when the cell is empty so the dropdown shows a value.
+  if (String(values[cell.row][cell.col] ?? "").trim() === "") {
+    range.setValue(ACTION_OPTIONS[0]);
+  }
+}
+
+/** Where a given step name was found: which sheet, and the 1-based Excel row. */
+interface NameOccurrence {
+  sheet: string;
+  excelRow: number;
+  display: string; // the name as authored (trimmed), for the error message
+}
+
+/**
+ * Add each non-blank step name on a sheet to a shared name->occurrences map. Pooling
+ * several sheets into one map lets uniqueness be enforced across all of them at once.
+ */
+function collectStepNames(
+  values: (string | number | boolean)[][],
+  geom: TableGeom,
+  sheetName: string,
+  topRow: number,
+  into: Map<string, NameOccurrence[]>
+): void {
+  for (let r = geom.headerRow + 1; r < values.length; r++) {
+    const raw = String(values[r][geom.stepCol] ?? "");
+    if (raw.trim() === "") {
+      continue; // skip blank step rows
+    }
+    const key = normalize(raw);
+    const occ: NameOccurrence = {
+      sheet: sheetName,
+      excelRow: topRow + r + 1, // 0-based index -> 1-based Excel row
+      display: raw.trim(),
+    };
+    const list = into.get(key);
+    if (list) {
+      list.push(occ);
+    } else {
+      into.set(key, [occ]);
+    }
+  }
+}
+
+/**
+ * Throws if two or more workflow steps share a (normalized) name — checked across the
+ * active sheet AND every sheet named by a "Linked Sheet" config row, as one combined
+ * pool. So a name colliding between any two linked sheets (not just with the active one)
+ * is caught, which keeps the whole split workflow safe to paste back together.
+ *
+ * Links are directional (only the active sheet's config is read) and non-transitive (a
+ * linked sheet's own "Linked Sheet" rows are NOT followed). A missing or step-table-less
+ * linked sheet is a hard error — the gate must never silently skip a requested check.
+ * Blank step rows are ignored. No-op when all names are unique.
+ */
+function ensureUniqueWorkflowSteps(
+  workbook: ExcelScript.Workbook,
+  sheet: ExcelScript.Worksheet,
+  values: (string | number | boolean)[][],
+  topRow: number,
+  geom: TableGeom
+): void {
+  const byName = new Map<string, NameOccurrence[]>();
+  const activeName = sheet.getName();
+  collectStepNames(values, geom, activeName, topRow, byName);
+
+  // Pool in each linked sheet's step names. Drop self-references and duplicates so a
+  // sheet is never read (or reported) twice.
+  const seen = new Set<string>([normalize(activeName)]);
+  for (const name of readConfigValues(values, geom, LINKED_SHEET_LABEL)) {
+    if (seen.has(normalize(name))) {
+      continue;
+    }
+    seen.add(normalize(name));
+
+    const other = workbook.getWorksheet(name);
+    if (!other) {
+      throw new Error(
+        `Config "${LINKED_SHEET_LABEL}" names sheet "${name}", but there is no such sheet.`
+      );
+    }
+    const otherUsed = other.getUsedRange();
+    if (!otherUsed) {
+      throw new Error(
+        `Linked sheet "${name}" is empty — no step table to check uniqueness against.`
+      );
+    }
+    const otherValues = otherUsed.getValues();
+    const otherGeom = tryLocateStepTable(otherValues);
+    if (!otherGeom) {
+      throw new Error(
+        `Linked sheet "${name}" has no "${STEP_HEADER}" column to check uniqueness against.`
+      );
+    }
+    collectStepNames(otherValues, otherGeom, other.getName(), otherUsed.getRowIndex(), byName);
+  }
+
+  const duplicates = Array.from(byName.values()).filter((occ) => occ.length > 1);
+  if (duplicates.length === 0) {
+    return; // all unique across the pool — success
+  }
+
+  const details = duplicates
+    .map((occ) => {
+      const where = occ.map((o) => `${o.sheet}!row ${o.excelRow}`).join(", ");
+      return `  - "${occ[0].display}" (${where})`;
+    })
+    .join("\n");
+
+  throw new Error(
+    `Workflow step names must be unique. Found ${duplicates.length} duplicate(s):\n${details}`
+  );
+}
+
+/** One row's place in the computed outline. */
+interface OutlineEntry {
+  rowIndex: number; // index into the values grid (the source row)
+  depth: number;    // tree depth -> indent level
+}
+
+/** A step row tracked in memory while computing the outline order. */
+interface StepRow {
+  key: string;        // normalized name (matching key)
+  parentKey: string;  // normalized parent name
+  order: number;      // original appearance index (stable sibling sort)
+  rowIndex: number;   // index into the values grid (the source row)
+  depth: number;      // computed tree depth
+}
+
+/** The step table parsed into a tree: rows, roots, and a parent->children index. */
+interface StepTree {
+  rows: StepRow[];                          // all non-blank step rows, appearance order
+  roots: StepRow[];                         // top-level rows, sorted by appearance
+  childrenByParent: Map<string, StepRow[]>; // each child list sorted by appearance
+}
+
+/**
+ * Parse the step table into a tree from its parent pointers — the shared basis for
+ * every hierarchy-aware action (outline order, numbering). Blank rows are skipped.
+ * A row is a root if it points to itself, has no parent, or names an unknown parent
+ * (dangling reference -> top-level, never dropped). Siblings keep their original
+ * appearance order. Assumes step names are unique (the gate has passed).
+ */
+function buildStepTree(
+  values: (string | number | boolean)[][],
+  geom: TableGeom
+): StepTree {
+  const rows: StepRow[] = [];
+  for (let r = geom.headerRow + 1; r < values.length; r++) {
+    const name = String(values[r][geom.stepCol] ?? "").trim();
+    if (name === "") {
+      continue;
+    }
+    rows.push({
+      key: normalize(name),
+      parentKey: normalize(String(values[r][geom.parentCol] ?? "")),
+      order: rows.length,
+      rowIndex: r,
+      depth: 0,
+    });
+  }
+
+  const byKey = new Map<string, StepRow>();
+  for (const row of rows) {
+    byKey.set(row.key, row); // uniqueness guaranteed by the gate
+  }
+  const childrenByParent = new Map<string, StepRow[]>();
+  const roots: StepRow[] = [];
+  for (const row of rows) {
+    const isRoot =
+      row.parentKey === "" || row.parentKey === row.key || !byKey.has(row.parentKey);
+    if (isRoot) {
+      roots.push(row);
+    } else {
+      const siblings = childrenByParent.get(row.parentKey);
+      if (siblings) {
+        siblings.push(row);
+      } else {
+        childrenByParent.set(row.parentKey, [row]);
+      }
+    }
+  }
+
+  // Stable sibling order = original appearance on the sheet.
+  roots.sort((a, b) => a.order - b.order);
+  for (const siblings of Array.from(childrenByParent.values())) {
+    siblings.sort((a, b) => a.order - b.order);
+  }
+
+  return { rows, roots, childrenByParent };
+}
+
+/**
+ * Compute the depth-first outline order of the step table from its parent
+ * pointers. Order-independent (rows may be in any order); siblings keep their
+ * original relative order. Blank rows are skipped. Rows unreachable from a root
+ * (e.g. a parent cycle) are appended flat at the end so nothing is lost.
+ * Assumes step names are unique (the gate has passed). Returns [] when no steps.
+ */
+function computeOutlineOrder(
+  values: (string | number | boolean)[][],
+  geom: TableGeom
+): OutlineEntry[] {
+  const tree = buildStepTree(values, geom);
+  if (tree.rows.length === 0) {
+    return [];
+  }
+
+  // Pre-order DFS: parent, then its descendants.
+  const ordered: StepRow[] = [];
+  const visited = new Set<string>();
+  const visit = (row: StepRow, depth: number): void => {
+    if (visited.has(row.key)) {
+      return; // re-entry guard (also defends against cycles)
+    }
+    visited.add(row.key);
+    row.depth = depth;
+    ordered.push(row);
+    const kids = tree.childrenByParent.get(row.key);
+    if (kids) {
+      for (const kid of kids) {
+        visit(kid, depth + 1);
+      }
+    }
+  };
+  for (const root of tree.roots) {
+    visit(root, 0);
+  }
+
+  // Data-loss guard: any row unreachable from a root (parent cycle) goes flat at
+  // the end so callers that clear/rewrite never drop it.
+  for (const row of tree.rows) {
+    if (!visited.has(row.key)) {
+      row.depth = 0;
+      visited.add(row.key);
+      ordered.push(row);
+    }
+  }
+
+  return ordered.map((s) => ({ rowIndex: s.rowIndex, depth: s.depth }));
+}
+
+/**
+ * Compute hierarchical outline numbers ("1", "1.1", "1.2", "2", …) for each step,
+ * keyed by source row index. Roots get a bare ordinal; a child gets its parent's
+ * number + "." + its 1-based position among siblings. Built from the same tree as
+ * computeOutlineOrder, so numbering and ordering can never disagree. Rows unreachable
+ * from a root (parent cycle) are left unnumbered. Returns an empty map when no steps.
+ */
+function computeOutlineNumbers(
+  values: (string | number | boolean)[][],
+  geom: TableGeom
+): Map<number, string> {
+  const tree = buildStepTree(values, geom);
+  const numbers = new Map<number, string>();
+  const visited = new Set<string>();
+  const visit = (row: StepRow, prefix: string): void => {
+    if (visited.has(row.key)) {
+      return; // re-entry guard (also defends against cycles)
+    }
+    visited.add(row.key);
+    numbers.set(row.rowIndex, prefix);
+    const kids = tree.childrenByParent.get(row.key);
+    if (kids) {
+      for (let i = 0; i < kids.length; i++) {
+        visit(kids[i], `${prefix}.${i + 1}`);
+      }
+    }
+  };
+  for (let i = 0; i < tree.roots.length; i++) {
+    visit(tree.roots[i], `${i + 1}`);
+  }
+  return numbers;
+}
+
+/**
+ * Reorganize the step table into a depth-first indented outline.
+ *
+ * Order-independent: the tree is built from parent pointers, so rows may be in
+ * any order on the sheet. Siblings keep their original relative order, so a row
+ * appended at the bottom sorts in last among its siblings.
+ *
+ * Rows are relocated with Excel's NATIVE SORT (driven by a temporary rank
+ * column), so each row carries ALL its content — values, formatting, and cell
+ * controls (checkboxes) — to its new position; nothing is rewritten cell-by-cell.
+ * Blank rows sort to the bottom and are deleted. The Parent Step column is then
+ * flush-lefted (clears any indent carried in from copying a name out of column A)
+ * and left/top-aligned, and the step-name column is indented by depth and top-aligned —
+ * so both columns read cleanly when a wrapped Notes cell makes a row tall.
+ *
+ * Assumes ensureUniqueWorkflowSteps has already passed (names are unique).
+ */
+function organizeWorkflow(
+  sheet: ExcelScript.Worksheet,
+  values: (string | number | boolean)[][],
+  topRow: number,
+  leftCol: number,
+  geom: TableGeom
+): void {
+  if (geom.parentCol === -1) {
+    throw new Error(`Could not find a "${PARENT_HEADER}" column header on this sheet.`);
+  }
+
+  const order = computeOutlineOrder(values, geom);
+  if (order.length === 0) {
+    return; // nothing to organize
+  }
+
+  // Reorder rows via Excel's NATIVE SORT, which relocates ENTIRE rows — values,
+  // formatting, AND cell controls (checkboxes) travel together, so nothing
+  // desyncs. We drive the order by writing each row's target rank into a
+  // temporary helper column (immediately right of the table), then sorting the
+  // body by that column. Blank rows get a sentinel rank so they sort to the
+  // bottom, where they're deleted.
+  const bodyTopAbs = topRow + geom.headerRow + 1;
+  const tableStartColAbs = leftCol + geom.stepCol;
+  const helperColAbs = tableStartColAbs + geom.width; // first empty column right of the table
+  const originalBodyRows = values.length - (geom.headerRow + 1);
+
+  const sentinel = originalBodyRows + 1; // ranks blank rows after every step
+  const ranks: number[][] = [];
+  for (let i = 0; i < originalBodyRows; i++) {
+    ranks.push([sentinel]);
+  }
+  for (let i = 0; i < order.length; i++) {
+    ranks[order[i].rowIndex - (geom.headerRow + 1)][0] = i;
+  }
+
+  // Write ranks, then sort the table columns + helper by the helper column.
+  sheet.getRangeByIndexes(bodyTopAbs, helperColAbs, originalBodyRows, 1).setValues(ranks);
+  sheet
+    .getRangeByIndexes(bodyTopAbs, tableStartColAbs, originalBodyRows, geom.width + 1)
+    .getSort()
+    .apply([{ key: geom.width, ascending: true }], false, false);
+
+  // Discard the helper column now that rows are ordered.
+  sheet
+    .getRangeByIndexes(bodyTopAbs, helperColAbs, originalBodyRows, 1)
+    .clear(ExcelScript.ClearApplyTo.contents);
+
+  // Delete the blank rows, now grouped at the bottom by the sentinel rank.
+  // (Deletes whole rows; assumes nothing else lives beside the table on them.)
+  const surplus = originalBodyRows - order.length;
+  if (surplus > 0) {
+    sheet
+      .getRangeByIndexes(bodyTopAbs + order.length, 0, surplus, 1)
+      .getEntireRow()
+      .delete(ExcelScript.DeleteShiftDirection.up);
+  }
+
+  // Defensive: re-assert checkbox controls on the Done column. Native sort
+  // should carry them, but the API doesn't guarantee it — so for any Done cell
+  // holding a boolean (i.e. it IS a checkbox), make sure the control is present.
+  // Only boolean cells are touched, so the user's authored checkboxes are
+  // preserved and none are imposed where the user didn't put one.
+  const doneCol = findColumnIndex(values, geom.headerRow, DONE_HEADER);
+  if (doneCol !== -1 && order.length > 0) {
+    const doneColAbs = leftCol + doneCol;
+    const doneVals = sheet
+      .getRangeByIndexes(bodyTopAbs, doneColAbs, order.length, 1)
+      .getValues();
+    for (let i = 0; i < order.length; i++) {
+      if (typeof doneVals[i][0] === "boolean") {
+        sheet
+          .getRangeByIndexes(bodyTopAbs + i, doneColAbs, 1, 1)
+          .setControl({ type: ExcelScript.CellControlType.checkbox });
+      }
+    }
+  }
+
+  // Flush-left the Parent Step column. A parent name is often copied straight from
+  // column A, which carries that cell's indent LEVEL (a format) along with the text.
+  // The indent doesn't affect matching (that's on the trimmed value), but it looks
+  // wrong in a parent-pointer column — so reset the whole column to indent 0, then
+  // pin it left-justified and top-aligned (so it lines up with the step name when a
+  // wrapped Notes cell makes the row tall). One write for the whole column.
+  const parentFormat = sheet
+    .getRangeByIndexes(bodyTopAbs, leftCol + geom.parentCol, order.length, 1)
+    .getFormat();
+  parentFormat.setIndentLevel(0);
+  parentFormat.setHorizontalAlignment(ExcelScript.HorizontalAlignment.left);
+  parentFormat.setVerticalAlignment(ExcelScript.VerticalAlignment.top);
+
+  // Top-align the step-name column too, in one write, so its indented label sits at
+  // the top of a tall row rather than floating in the vertical middle.
+  sheet
+    .getRangeByIndexes(bodyTopAbs, tableStartColAbs, order.length, 1)
+    .getFormat()
+    .setVerticalAlignment(ExcelScript.VerticalAlignment.top);
+
+  // Indent the step-name cell (table's first column) by tree depth. Done last so
+  // it overrides whatever indent each row carried in from its old position.
+  for (let i = 0; i < order.length; i++) {
+    sheet
+      .getRangeByIndexes(bodyTopAbs + i, tableStartColAbs, 1, 1)
+      .getFormat()
+      .setIndentLevel(order[i].depth * INDENT_PER_LEVEL);
+  }
+}
+
+/**
+ * Renumber: write hierarchical outline numbers ("1", "1.1", "1.2", …) into the "No."
+ * column, computed from the tree. The number is DERIVED data and lives only in its own
+ * column — never in the step name, which is the identity / parent-matching key.
+ *
+ * Order-independent (numbers follow the hierarchy, not row position), so it doesn't
+ * reorder rows or touch any other column — only the "No." column changes. Pairs well
+ * after Organize. Requires a "No." column to exist (throws otherwise rather than
+ * imposing structure). Numbers go stale on structural edits — re-run after Organize.
+ * Assumes the uniqueness gate has passed.
+ */
+function renumberWorkflow(
+  sheet: ExcelScript.Worksheet,
+  values: (string | number | boolean)[][],
+  topRow: number,
+  leftCol: number,
+  geom: TableGeom
+): void {
+  if (geom.parentCol === -1) {
+    throw new Error(`Could not find a "${PARENT_HEADER}" column header on this sheet.`);
+  }
+  const numberCol = findColumnIndex(values, geom.headerRow, NUMBER_HEADER);
+  if (numberCol === -1) {
+    throw new Error(`Add a "${NUMBER_HEADER}" column to the step table, then run Renumber.`);
+  }
+
+  const bodyTop = geom.headerRow + 1;
+  const bodyRows = values.length - bodyTop;
+  if (bodyRows <= 0) {
+    return; // no body rows to number
+  }
+
+  const numbers = computeOutlineNumbers(values, geom);
+  const out: string[][] = [];
+  for (let r = bodyTop; r < values.length; r++) {
+    out.push([numbers.get(r) ?? ""]); // blank rows / cycle-orphans stay empty
+  }
+
+  // Force the column to text first, so "1.1" / "1.10" / "1.1.1" are stored verbatim
+  // and not coerced to numbers (which would drop trailing zeros and right-align).
+  const colRange = sheet.getRangeByIndexes(topRow + bodyTop, leftCol + numberCol, bodyRows, 1);
+  colRange.setNumberFormat("@");
+  colRange.setValues(out);
+}
+
+/**
+ * Un-number: clear the values in the "No." column, undoing Renumber. Clears CONTENTS
+ * only — the column and its header stay, since the user may have added the column
+ * themselves. No-op when there is no "No." column. Non-destructive to everything else.
+ */
+function unnumberWorkflow(
+  sheet: ExcelScript.Worksheet,
+  values: (string | number | boolean)[][],
+  topRow: number,
+  leftCol: number,
+  geom: TableGeom
+): void {
+  const numberCol = findColumnIndex(values, geom.headerRow, NUMBER_HEADER);
+  if (numberCol === -1) {
+    return; // nothing to clear
+  }
+  const bodyTop = geom.headerRow + 1;
+  const bodyRows = values.length - bodyTop;
+  if (bodyRows <= 0) {
+    return;
+  }
+  sheet
+    .getRangeByIndexes(topRow + bodyTop, leftCol + numberCol, bodyRows, 1)
+    .clear(ExcelScript.ClearApplyTo.contents);
+}
+
+/** Read a config property's value by its label (the cell to its right). "" if absent. */
+function readConfigValue(
+  values: (string | number | boolean)[][],
+  geom: TableGeom,
+  label: string
+): string {
+  for (let r = 0; r < geom.headerRow; r++) {
+    for (let c = 0; c + 1 < values[r].length; c++) {
+      if (normalize(String(values[r][c])) === normalize(label)) {
+        return String(values[r][c + 1] ?? "").trim();
+      }
+    }
+  }
+  return "";
+}
+
+/**
+ * Read EVERY value for a config label (the cell to its right), one per matching row —
+ * for repeatable properties like "Linked Sheet". Blank values are skipped. Unlike
+ * readConfigValue (first match only), this collects all occurrences in row order.
+ */
+function readConfigValues(
+  values: (string | number | boolean)[][],
+  geom: TableGeom,
+  label: string
+): string[] {
+  const out: string[] = [];
+  for (let r = 0; r < geom.headerRow; r++) {
+    for (let c = 0; c + 1 < values[r].length; c++) {
+      if (normalize(String(values[r][c])) === normalize(label)) {
+        const value = String(values[r][c + 1] ?? "").trim();
+        if (value !== "") {
+          out.push(value);
+        }
+        break; // one value per row; move on to the next row
+      }
+    }
+  }
+  return out;
+}
+
+/** Published-checklist layout. */
+const PUBLISH_HEADER_ROW = 2; // 0-based (Excel row 3); the title sits on row 1
+
+/** One output column of the published checklist, resolved from a source table column. */
+interface PublishColumn {
+  label: string;   // header text to write on the published sheet
+  srcCol: number;  // source table column to mirror (value + format + any checkbox)
+  isStep: boolean; // the Step column, which absorbs the folded "No." outline number
+}
+
+/**
+ * Publish: compile the definition into a clean checklist on the sheet named by
+ * the "Published Sheet" config property. The target is RE-CREATED every run — the
+ * source sheet is the single source of truth, so the published sheet holds no
+ * state of its own.
+ *
+ * MIRRORS the source rather than imposing a look: each published cell is COPIED
+ * from its source cell (value + formatting + checkbox control), so fonts, colours,
+ * indentation, and checkboxes match the source exactly — a checkbox appears only
+ * where the source has one, and nothing is styled that the source didn't style.
+ * The published header takes its formatting from the matching source header cells.
+ * Layout: title (A1) over the step table in outline order. Columns MIRROR the source
+ * order: walking the table run left-to-right from "Workflow Step" (relabeled "Step"),
+ * each column is emitted as-authored — Done, Notes, and any well-formed user column
+ * (Assigned To, URL, …) land where the user put them. The "Parent Step" column and the
+ * config block are dropped. A user column travels exactly when it obeys the same contract
+ * Organize relies on: a non-blank header inside the contiguous run starting at "Workflow
+ * Step" (geom.width). The engine never enumerates these columns by name.
+ *
+ * If the source has a "No." column (see Renumber), its outline number is folded into
+ * the published Step label ("1.1 Step name") rather than emitted as a separate column —
+ * a clean numbered checklist the hide-the-columns workaround can't produce. Renders the
+ * numbers as-is, so run Organize + Renumber first if they've gone stale.
+ *
+ * A "Label" column, if present, overrides the published Step name for any row that sets it:
+ * the source keeps its unique "Workflow Step" name (the identity/parent key the uniqueness
+ * gate enforces), while the checklist shows the friendlier Label. Like "No." it is folded
+ * into the Step column, never emitted as its own column, and composes with the number
+ * ("1.1 <Label>"). This is purely cosmetic and Publish-only — it never touches the source.
+ */
+function publishWorkflow(
+  workbook: ExcelScript.Workbook,
+  sheet: ExcelScript.Worksheet,
+  values: (string | number | boolean)[][],
+  topRow: number,
+  leftCol: number,
+  geom: TableGeom
+): void {
+  if (geom.parentCol === -1) {
+    throw new Error(`Could not find a "${PARENT_HEADER}" column header on this sheet.`);
+  }
+
+  // Resolve and validate the target sheet name.
+  const target = readConfigValue(values, geom, PUBLISHED_SHEET_LABEL);
+  if (target === "") {
+    throw new Error(`Set a "${PUBLISHED_SHEET_LABEL}" value in the config to name the output sheet.`);
+  }
+  if (normalize(target) === normalize(sheet.getName())) {
+    throw new Error(
+      `"${PUBLISHED_SHEET_LABEL}" ("${target}") must differ from the definition sheet — Publish re-creates it.`
+    );
+  }
+
+  const doneCol = findColumnIndex(values, geom.headerRow, DONE_HEADER);
+  const notesCol = findColumnIndex(values, geom.headerRow, NOTES_HEADER);
+  const numberCol = findColumnIndex(values, geom.headerRow, NUMBER_HEADER);
+  const labelCol = findColumnIndex(values, geom.headerRow, LABEL_HEADER);
+  const order = computeOutlineOrder(values, geom);
+
+  // Resolve the output columns by MIRRORING the source column order. Walk the table
+  // run left-to-right from "Workflow Step" (its left edge, geom.width wide) and emit
+  // each column as-authored, except:
+  //   - Parent Step — dropped (structural; redundant once the outline is flattened),
+  //   - No.         — folded into the Step label below, so not its own column,
+  //   - Label       — folded into the Step label below (display override), so not its own column.
+  // "Workflow Step" is relabeled "Step"; Done/Notes keep their names; user columns
+  // keep their headers verbatim. Only columns inside geom.width are considered, so a
+  // custom column publishes exactly when it obeys Organize's contiguous-header contract.
+  const columns: PublishColumn[] = [];
+  for (let c = geom.stepCol; c < geom.stepCol + geom.width; c++) {
+    if (c === geom.parentCol || c === numberCol || c === labelCol) continue;
+    let label: string;
+    if (c === geom.stepCol) label = "Step";
+    else if (c === doneCol) label = "Done";
+    else if (c === notesCol) label = "Notes";
+    else label = String(values[geom.headerRow][c] ?? "").trim();
+    columns.push({ label, srcCol: c, isStep: c === geom.stepCol });
+  }
+
+  // Re-create the target sheet from scratch.
+  const existing = workbook.getWorksheet(target);
+  if (existing) {
+    existing.delete();
+  }
+  const out = workbook.addWorksheet(target);
+  out.activate();
+
+  // Title (row 1).
+  const titleCell = out.getRange("A1");
+  titleCell.setValue(readConfigValue(values, geom, WORKFLOW_NAME_LABEL) || target);
+  titleCell.getFormat().getFont().setBold(true);
+  titleCell.getFormat().getFont().setSize(16);
+
+  // Header row: published label per column, formatting copied from its source header.
+  const headerRowAbs = topRow + geom.headerRow;
+  for (let c = 0; c < columns.length; c++) {
+    const destCell = out.getRangeByIndexes(PUBLISH_HEADER_ROW, c, 1, 1);
+    destCell.copyFrom(
+      sheet.getRangeByIndexes(headerRowAbs, leftCol + columns[c].srcCol, 1, 1),
+      ExcelScript.RangeCopyType.formats
+    );
+    destCell.setValue(columns[c].label);
+  }
+
+  // Body: copy each step's source cells (value + formatting + checkbox) in outline
+  // order, one published column per source column. Nothing is imposed.
+  const firstBodyRow = PUBLISH_HEADER_ROW + 1;
+  for (let i = 0; i < order.length; i++) {
+    const srcRowAbs = topRow + order[i].rowIndex;
+    const outRow = firstBodyRow + i;
+    // Mirror the source row's height. The source may deliberately fix a short height
+    // (e.g. 15) on a wrapped/multi-line cell so the overflow stays clipped; copyFrom
+    // carries cell formatting but NOT row height, so set it explicitly here. (Earlier
+    // this autofit each row, which expanded those deliberately-short rows — the opposite
+    // of mirroring.)
+    const srcHeight = sheet
+      .getRangeByIndexes(srcRowAbs, leftCol, 1, 1)
+      .getFormat()
+      .getRowHeight();
+    out
+      .getRangeByIndexes(outRow, 0, 1, columns.length)
+      .getFormat()
+      .setRowHeight(srcHeight);
+    for (let c = 0; c < columns.length; c++) {
+      const col = columns[c];
+      const destCell = out.getRangeByIndexes(outRow, c, 1, 1);
+      destCell.copyFrom(
+        sheet.getRangeByIndexes(srcRowAbs, leftCol + col.srcCol, 1, 1),
+        ExcelScript.RangeCopyType.all
+      );
+      // A boolean source cell IS a checkbox — re-assert the control so it travels
+      // (covers Done and any user boolean column); never imposed where absent.
+      if (typeof values[order[i].rowIndex][col.srcCol] === "boolean") {
+        destCell.setControl({ type: ExcelScript.CellControlType.checkbox });
+      }
+      // Step column: the published name is the "Label" override when set, else the
+      // "Workflow Step" name, with any "No." outline number folded in front
+      // ("1.1 <name>"). Overrides the copied value but keeps the copied format (indent
+      // + alignment). Only writes when the result differs from the copied step name, so
+      // a row with neither a Label nor a number is left exactly as copied.
+      if (col.isStep) {
+        const srcRow = order[i].rowIndex;
+        const stepName = String(values[srcRow][geom.stepCol] ?? "").trim();
+        const override = labelCol !== -1 ? String(values[srcRow][labelCol] ?? "").trim() : "";
+        const base = override !== "" ? override : stepName;
+        const number = numberCol !== -1 ? String(values[srcRow][numberCol] ?? "").trim() : "";
+        // Two spaces after the number for clearer visual separation between the outline
+        // number and the step text (Excel renders literal spaces, so this shows as typed).
+        const display = number !== "" ? `${number}  ${base}` : base;
+        if (display !== stepName) {
+          destCell.setValue(display);
+        }
+      }
+    }
+  }
+
+  // Match each published column's width to its source column, so wrap behaviour
+  // mirrors the source: a note that fits one line in the source fits one line here too.
+  // Row heights are mirrored separately (set per body row from the source above).
+  for (let c = 0; c < columns.length; c++) {
+    const width = sheet
+      .getRangeByIndexes(headerRowAbs, leftCol + columns[c].srcCol, 1, 1)
+      .getFormat()
+      .getColumnWidth();
+    out
+      .getRangeByIndexes(PUBLISH_HEADER_ROW, c, 1, 1)
+      .getEntireColumn()
+      .getFormat()
+      .setColumnWidth(width);
+  }
+
+  out.getFreezePanes().freezeRows(firstBodyRow);
+}
+
+/** A starter step: text, parent reference, note, checkbox state, and tree depth. */
+interface StarterStep {
+  step: string;
+  parent: string;
+  notes: string;
+  done: boolean;
+  depth: number;
+}
+
+/**
+ * The starter workflow written onto a blank sheet — a guide to the engine,
+ * written AS a workflow so it doubles as a working example. Names are unique and
+ * each `parent` matches a `step` exactly (the parent-pointer model).
+ */
+const STARTER_STEPS: StarterStep[] = [
+  // Several top-level sections (each its own root: parent = itself) — the workflow's
+  // identity lives in the "Workflow Name" config value, not in a single wrapper step.
+  { step: "Understand the layout", parent: "Understand the layout", notes: "This sheet is both the guide and a working example — edit it freely, then run the script.", done: false, depth: 0 },
+  { step: "The top block sets options: Workflow Name, Published Sheet, Action", parent: "Understand the layout", notes: "Options are read by their label, so the block can move.", done: false, depth: 1 },
+  { step: "This table is your workflow: one row per step", parent: "Understand the layout", notes: "", done: false, depth: 1 },
+  { step: "Each step names its Parent Step to build the hierarchy", parent: "Understand the layout", notes: "A step whose parent is itself (or blank) is top-level.", done: false, depth: 1 },
+  { step: "Hierarchy is data, not indentation", parent: "Each step names its Parent Step to build the hierarchy", notes: "Rows can start in any order — Organize reflows them.", done: false, depth: 2 },
+  { step: "So rows can be in any order until you Organize", parent: "Hierarchy is data, not indentation", notes: "You never hand-indent; depth comes from the parent chain.", done: false, depth: 3 },
+
+  { step: "Edit your workflow", parent: "Edit your workflow", notes: "", done: false, depth: 0 },
+  { step: "Add a step: type a unique name under Workflow Step", parent: "Edit your workflow", notes: "Step names must be unique.", done: false, depth: 1 },
+  { step: "Nest it: put its parent's name under Parent Step", parent: "Edit your workflow", notes: "", done: false, depth: 1 },
+  { step: "Children can have children — nest as deep as you like", parent: "Nest it: put its parent's name under Parent Step", notes: "", done: false, depth: 2 },
+  { step: "This line is four levels deep, just to show it scales", parent: "Children can have children — nest as deep as you like", notes: "Indent is applied automatically by depth.", done: false, depth: 3 },
+  { step: "Add context under Notes", parent: "Edit your workflow", notes: "Notes carry through to Publish.", done: false, depth: 1 },
+  { step: "Tick Done when a step is complete", parent: "Edit your workflow", notes: "", done: true, depth: 1 },
+
+  { step: "Organize the sheet", parent: "Organize the sheet", notes: "", done: false, depth: 0 },
+  { step: "Set Action to Organize, then run", parent: "Organize the sheet", notes: "Rows sort into an indented outline; blank rows are removed.", done: false, depth: 1 },
+  { step: "Add new steps at the bottom, then Organize again", parent: "Organize the sheet", notes: "They file themselves under their parent.", done: false, depth: 1 },
+
+  { step: "Number the steps", parent: "Number the steps", notes: "", done: false, depth: 0 },
+  { step: "Set Action to Renumber, then run", parent: "Number the steps", notes: "Fills the No. column with outline numbers (1, 1.1, 1.2 …). Un-number clears them.", done: false, depth: 1 },
+
+  { step: "Publish a checklist", parent: "Publish a checklist", notes: "", done: false, depth: 0 },
+  { step: "Set Published Sheet to a name for the output", parent: "Publish a checklist", notes: "", done: false, depth: 1 },
+  { step: "Set Action to Publish, then run", parent: "Publish a checklist", notes: "Creates a clean checklist that mirrors your columns (incl. custom ones); folds any No. number into the label.", done: false, depth: 1 },
+  { step: "Publish mirrors this sheet and never edits your source", parent: "Publish a checklist", notes: "", done: false, depth: 1 },
+
+  // A self-contained worked example — a mini project nested several levels deep, so a new
+  // user can see at a glance what the outline (and Renumber's 1 / 1.1 / 1.1.1 …) looks like.
+  { step: "See it nest: a worked example", parent: "See it nest: a worked example", notes: "A mini project below, indented by depth so the structure reads at a glance.", done: false, depth: 0 },
+  { step: "Plan the launch", parent: "See it nest: a worked example", notes: "", done: false, depth: 1 },
+  { step: "Define the scope", parent: "Plan the launch", notes: "", done: false, depth: 2 },
+  { step: "List the must-have features", parent: "Define the scope", notes: "", done: true, depth: 3 },
+  { step: "Cut the nice-to-haves for v1", parent: "Define the scope", notes: "", done: false, depth: 3 },
+  { step: "Estimate the timeline", parent: "Plan the launch", notes: "", done: false, depth: 2 },
+  { step: "Build it", parent: "See it nest: a worked example", notes: "", done: false, depth: 1 },
+  { step: "Write the feature", parent: "Build it", notes: "", done: false, depth: 2 },
+  { step: "Code the happy path", parent: "Write the feature", notes: "", done: false, depth: 3 },
+  { step: "Handle the edge cases", parent: "Write the feature", notes: "", done: false, depth: 3 },
+  { step: "Review and test", parent: "Build it", notes: "", done: false, depth: 2 },
+  { step: "Ship it", parent: "See it nest: a worked example", notes: "", done: false, depth: 1 },
+  { step: "Publish the checklist for the team", parent: "Ship it", notes: "", done: false, depth: 2 },
+];
+
+/**
+ * Lay down the starter workflow on a brand-new (empty) sheet: the config block,
+ * the step table header, and the self-documenting guide (already indented, with
+ * checkboxes and the Action dropdown). So running the script on a blank sheet
+ * gives a new user working, explained boilerplate instead of a blank page.
+ */
+function scaffoldStarterSheet(sheet: ExcelScript.Worksheet): void {
+  const HEADER_FILL = "D9D9D9";
+  const TABLE_WIDTH = 5; // Workflow Step | Parent Step | Notes | Done | No. (cols A:E)
+
+  // Config block (standard layout): a grey "Property | Property Value" header
+  // filled across the table width (A:E), then label | value pairs read by label —
+  // Workflow Name (row 2), Published Sheet (row 3), Action (row 4).
+  sheet.getRangeByIndexes(0, 0, 1, TABLE_WIDTH).getFormat().getFill().setColor(HEADER_FILL);
+  const configHeader = sheet.getRangeByIndexes(0, 0, 1, 2);
+  configHeader.setValues([["Property", "Property Value"]]);
+  configHeader.getFormat().getFont().setBold(true);
+
+  const ROW_NAME = 1;
+  const ROW_PUBLISH = 2;
+  const ROW_ACTION = 3;
+  sheet.getRangeByIndexes(ROW_NAME, 0, 1, 2).setValues([[WORKFLOW_NAME_LABEL, "Workflow Engine: Quick Start"]]);
+  sheet.getRangeByIndexes(ROW_PUBLISH, 0, 1, 2).setValues([[PUBLISHED_SHEET_LABEL, "Workflow Checklist"]]);
+  sheet.getRangeByIndexes(ROW_ACTION, 0, 1, 2).setValues([[ACTION_LABEL, ACTION_OPTIONS[0]]]);
+  for (const labelRow of [ROW_NAME, ROW_PUBLISH, ROW_ACTION]) {
+    sheet.getRangeByIndexes(labelRow, 0, 1, 1).getFormat().getFont().setBold(true); // bold labels
+  }
+
+  // Self-healing Action dropdown on its value cell (B4), via the shared helper.
+  applyActionDropdown(sheet.getRangeByIndexes(ROW_ACTION, 1, 1, 1));
+
+  // Step table header (blank row 5 separates it from the config block), grey A:E.
+  // The empty "No." column is here so Renumber works on the starter sheet right away.
+  const headers = [STEP_HEADER, PARENT_HEADER, NOTES_HEADER, DONE_HEADER, NUMBER_HEADER];
+  const headerRow = ROW_ACTION + 2; // row 6 (0-based index 5)
+  const tableHeader = sheet.getRangeByIndexes(headerRow, 0, 1, headers.length);
+  tableHeader.setValues([headers]);
+  tableHeader.getFormat().getFont().setBold(true);
+  tableHeader.getFormat().getFill().setColor(HEADER_FILL);
+
+  // Step rows: values in one write, then per-row indent / bold root / checkbox.
+  const firstStepRow = headerRow + 1;
+  const body: (string | boolean)[][] = STARTER_STEPS.map((s) => [s.step, s.parent, s.notes, s.done, ""]);
+  sheet.getRangeByIndexes(firstStepRow, 0, body.length, headers.length).setValues(body);
+
+  // Match Organize's column alignment so the starter sheet reads cleanly before its
+  // first run: step column (A) top-aligned, parent column (B) left-justified + top.
+  sheet
+    .getRangeByIndexes(firstStepRow, 0, body.length, 1)
+    .getFormat()
+    .setVerticalAlignment(ExcelScript.VerticalAlignment.top);
+  const parentFormat = sheet.getRangeByIndexes(firstStepRow, 1, body.length, 1).getFormat();
+  parentFormat.setHorizontalAlignment(ExcelScript.HorizontalAlignment.left);
+  parentFormat.setVerticalAlignment(ExcelScript.VerticalAlignment.top);
+
+  for (let i = 0; i < STARTER_STEPS.length; i++) {
+    const s = STARTER_STEPS[i];
+    const r = firstStepRow + i;
+    const stepCell = sheet.getRangeByIndexes(r, 0, 1, 1);
+    stepCell.getFormat().setIndentLevel(s.depth * INDENT_PER_LEVEL);
+    if (s.depth === 0) {
+      stepCell.getFormat().getFont().setBold(true);
+    }
+    sheet.getRangeByIndexes(r, 3, 1, 1).setControl({ type: ExcelScript.CellControlType.checkbox });
+  }
+
+  // Readable column widths.
+  sheet.getRange("A:A").getFormat().setColumnWidth(340);
+  sheet.getRange("B:B").getFormat().setColumnWidth(230);
+  sheet.getRange("C:C").getFormat().setColumnWidth(320);
+  sheet.getRange("D:D").getFormat().setColumnWidth(60);
+  sheet.getRange("E:E").getFormat().setColumnWidth(50); // No. — filled by Renumber
+}
