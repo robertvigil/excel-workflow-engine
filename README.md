@@ -107,6 +107,15 @@ problems are reported as an error message.
 - **Unique step names** are enforced up front — they're the identity used to match each
   child to its parent.
 
+## Companion: export to Word
+
+A separate, optional add-in can export a workflow to a **Word document** — a clickable
+Table of Contents, a heading per step (nested by depth), your `Notes` as the body, and
+screenshots embedded inline via `![[image-name]]` references. It's a small Excel macro
+that drives Word, kept entirely out of the core script (it's VBA and Windows-desktop-only,
+the opposite of the Office Script). See [`word-export/`](word-export/) for the macro and
+its own README.
+
 ## Credits
 
 Vibe-coded with [Claude](https://claude.com/claude-code) (Anthropic) — designed and
