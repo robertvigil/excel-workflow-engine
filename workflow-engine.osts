@@ -3,7 +3,8 @@
  *
  * The script reads the sheet once, runs the uniqueness gate, then dispatches
  * on the "Action" config property:
- *   - Organize — reflow the table into an indented outline.
+ *   - Organize — reflow the table into an indented outline, and (when the
+ *     "Numbered" option is true) fill the "No." column with outline numbers.
  *   - Publish  — compile the definition into a formatted checklist sheet.
  * On a completely empty sheet it instead lays down a starter workflow — a
  * self-documenting guide written as a workflow (config block + step table).
@@ -41,16 +42,10 @@ function main(workbook: ExcelScript.Workbook) {
   const action = requested === "" ? ACTION_ORGANIZE : normalize(requested);
   switch (action) {
     case ACTION_ORGANIZE:
-      organizeWorkflow(sheet, values, topRow, leftCol, geom);
+      organizeWorkflow(sheet, values, topRow, leftCol, geom, readNumberedOption(values, geom));
       break;
     case ACTION_PUBLISH:
       publishWorkflow(workbook, sheet, values, topRow, leftCol, geom);
-      break;
-    case ACTION_RENUMBER:
-      renumberWorkflow(sheet, values, topRow, leftCol, geom);
-      break;
-    case ACTION_UNNUMBER:
-      unnumberWorkflow(sheet, values, topRow, leftCol, geom);
       break;
     default:
       throw new Error(
@@ -67,14 +62,14 @@ const PARENT_HEADER = "Parent Step";
 const DONE_HEADER = "Done";
 /** Header text for the notes column. */
 const NOTES_HEADER = "Notes";
-/** Header text for the (optional) outline-number column written by Renumber. */
+/** Header text for the (optional) outline-number column filled by Organize when "Numbered" is true. */
 const NUMBER_HEADER = "No.";
 /**
  * Header text for the (optional) display-label column. A Publish-only override: when a
  * row has a non-blank "Label", the published checklist shows it in place of the
  * "Workflow Step" name — so the source keeps its unique (and possibly messy) step names
  * while the published sheet reads cleanly. Folded into the Step column, never published
- * as its own column. Has no effect on Organize/Renumber or the uniqueness gate.
+ * as its own column. Has no effect on Organize or the uniqueness gate.
  */
 const LABEL_HEADER = "Label";
 /** Config property naming the sheet that Publish creates (re-created each run). */
@@ -94,14 +89,21 @@ const ACTION_LABEL = "Action";
 /** Recognized actions (normalized). Organize is the default when the cell is blank. */
 const ACTION_ORGANIZE = "organize";
 const ACTION_PUBLISH = "publish";
-const ACTION_RENUMBER = "renumber";
-const ACTION_UNNUMBER = "un-number";
 /**
  * Display labels for the self-healing Action dropdown. The first entry is the
  * seeded default. Keep these words in sync with the ACTION_* keys above (each label
  * must normalize() to its key).
  */
-const ACTION_OPTIONS = ["Organize", "Publish", "Renumber", "Un-number"];
+const ACTION_OPTIONS = ["Organize", "Publish"];
+
+/**
+ * Config property (column-A label) that controls numbering. When "true", Organize also
+ * writes hierarchical outline numbers into the "No." column; when "false" (or absent) it
+ * clears that column instead. Set once per sheet as plain typed text — it's a set-and-forget
+ * preference, so it's intentionally NOT a dropdown (a typed value persists cleanly across
+ * sessions and never needs re-picking).
+ */
+const NUMBERED_LABEL = "Numbered";
 
 /** Excel indent levels applied per tree depth when organizing the outline. */
 const INDENT_PER_LEVEL = 2;
@@ -214,6 +216,27 @@ function readAction(values: (string | number | boolean)[][], geom: TableGeom): s
     return "";
   }
   return String(values[cell.row][cell.col] ?? "").trim();
+}
+
+/**
+ * Read the "Numbered" option (plain typed true/false in the config block). Returns whether
+ * Organize should number the outline: absent/blank => false; "true"/"false" recognized
+ * case-insensitively. Any other non-empty value is a hard error rather than a silent guess,
+ * matching the engine's "never a silent skip" discipline.
+ */
+function readNumberedOption(
+  values: (string | number | boolean)[][],
+  geom: TableGeom
+): boolean {
+  const raw = readConfigValue(values, geom, NUMBERED_LABEL);
+  const v = normalize(raw);
+  if (v === "" || v === "false") {
+    return false;
+  }
+  if (v === "true") {
+    return true;
+  }
+  throw new Error(`Config "${NUMBERED_LABEL}" must be "true" or "false" (got "${raw}").`);
 }
 
 /**
@@ -582,10 +605,21 @@ function organizeWorkflow(
   values: (string | number | boolean)[][],
   topRow: number,
   leftCol: number,
-  geom: TableGeom
+  geom: TableGeom,
+  numbered: boolean
 ): void {
   if (geom.parentCol === -1) {
     throw new Error(`Could not find a "${PARENT_HEADER}" column header on this sheet.`);
+  }
+
+  // When numbering is on, the "No." column must exist BEFORE we mutate anything — fail up
+  // front (as the old Renumber action did) rather than reordering rows and only then
+  // discovering we can't number them. When numbering is off the column is optional.
+  const numberCol = findColumnIndex(values, geom.headerRow, NUMBER_HEADER);
+  if (numbered && numberCol === -1) {
+    throw new Error(
+      `Add a "${NUMBER_HEADER}" column to the step table, then run Organize with "${NUMBERED_LABEL}" set to true.`
+    );
   }
 
   const order = computeOutlineOrder(values, geom);
@@ -683,77 +717,28 @@ function organizeWorkflow(
       .getFormat()
       .setIndentLevel(order[i].depth * INDENT_PER_LEVEL);
   }
-}
 
-/**
- * Renumber: write hierarchical outline numbers ("1", "1.1", "1.2", …) into the "No."
- * column, computed from the tree. The number is DERIVED data and lives only in its own
- * column — never in the step name, which is the identity / parent-matching key.
- *
- * Order-independent (numbers follow the hierarchy, not row position), so it doesn't
- * reorder rows or touch any other column — only the "No." column changes. Pairs well
- * after Organize. Requires a "No." column to exist (throws otherwise rather than
- * imposing structure). Numbers go stale on structural edits — re-run after Organize.
- * Assumes the uniqueness gate has passed.
- */
-function renumberWorkflow(
-  sheet: ExcelScript.Worksheet,
-  values: (string | number | boolean)[][],
-  topRow: number,
-  leftCol: number,
-  geom: TableGeom
-): void {
-  if (geom.parentCol === -1) {
-    throw new Error(`Could not find a "${PARENT_HEADER}" column header on this sheet.`);
+  // Numbering — folds in what used to be the separate Renumber / Un-number actions.
+  // Rows are now in outline order with blanks stripped, so body row i is order[i]. The
+  // outline numbers are keyed by each row's index in the PRE-sort snapshot, so we look
+  // each one up by order[i].rowIndex and write them straight down the (now-sorted) column.
+  if (numbered) {
+    const numbers = computeOutlineNumbers(values, geom);
+    const out: string[][] = [];
+    for (let i = 0; i < order.length; i++) {
+      out.push([numbers.get(order[i].rowIndex) ?? ""]); // cycle-orphans stay blank
+    }
+    // Force the column to text first, so "1.1" / "1.10" / "1.1.1" store verbatim and
+    // aren't coerced to numbers (which would drop trailing zeros and right-align).
+    const colRange = sheet.getRangeByIndexes(bodyTopAbs, leftCol + numberCol, order.length, 1);
+    colRange.setNumberFormat("@");
+    colRange.setValues(out);
+  } else if (numberCol !== -1) {
+    // Numbering off: clear any existing outline numbers (this is the old Un-number).
+    sheet
+      .getRangeByIndexes(bodyTopAbs, leftCol + numberCol, order.length, 1)
+      .clear(ExcelScript.ClearApplyTo.contents);
   }
-  const numberCol = findColumnIndex(values, geom.headerRow, NUMBER_HEADER);
-  if (numberCol === -1) {
-    throw new Error(`Add a "${NUMBER_HEADER}" column to the step table, then run Renumber.`);
-  }
-
-  const bodyTop = geom.headerRow + 1;
-  const bodyRows = values.length - bodyTop;
-  if (bodyRows <= 0) {
-    return; // no body rows to number
-  }
-
-  const numbers = computeOutlineNumbers(values, geom);
-  const out: string[][] = [];
-  for (let r = bodyTop; r < values.length; r++) {
-    out.push([numbers.get(r) ?? ""]); // blank rows / cycle-orphans stay empty
-  }
-
-  // Force the column to text first, so "1.1" / "1.10" / "1.1.1" are stored verbatim
-  // and not coerced to numbers (which would drop trailing zeros and right-align).
-  const colRange = sheet.getRangeByIndexes(topRow + bodyTop, leftCol + numberCol, bodyRows, 1);
-  colRange.setNumberFormat("@");
-  colRange.setValues(out);
-}
-
-/**
- * Un-number: clear the values in the "No." column, undoing Renumber. Clears CONTENTS
- * only — the column and its header stay, since the user may have added the column
- * themselves. No-op when there is no "No." column. Non-destructive to everything else.
- */
-function unnumberWorkflow(
-  sheet: ExcelScript.Worksheet,
-  values: (string | number | boolean)[][],
-  topRow: number,
-  leftCol: number,
-  geom: TableGeom
-): void {
-  const numberCol = findColumnIndex(values, geom.headerRow, NUMBER_HEADER);
-  if (numberCol === -1) {
-    return; // nothing to clear
-  }
-  const bodyTop = geom.headerRow + 1;
-  const bodyRows = values.length - bodyTop;
-  if (bodyRows <= 0) {
-    return;
-  }
-  sheet
-    .getRangeByIndexes(topRow + bodyTop, leftCol + numberCol, bodyRows, 1)
-    .clear(ExcelScript.ClearApplyTo.contents);
 }
 
 /** Read a config property's value by its label (the cell to its right). "" if absent. */
@@ -826,10 +811,11 @@ interface PublishColumn {
  * Organize relies on: a non-blank header inside the contiguous run starting at "Workflow
  * Step" (geom.width). The engine never enumerates these columns by name.
  *
- * If the source has a "No." column (see Renumber), its outline number is folded into
- * the published Step label ("1.1 Step name") rather than emitted as a separate column —
- * a clean numbered checklist the hide-the-columns workaround can't produce. Renders the
- * numbers as-is, so run Organize + Renumber first if they've gone stale.
+ * If the source has a "No." column (filled by Organize when the "Numbered" option is on),
+ * its outline number is folded into the published Step label ("1.1 Step name") rather than
+ * emitted as a separate column — a clean numbered checklist the hide-the-columns workaround
+ * can't produce. Renders the numbers as-is, so run Organize with Numbered on first if they've
+ * gone stale.
  *
  * A "Label" column, if present, overrides the published Step name for any row that sets it:
  * the source keeps its unique "Workflow Step" name (the identity/parent key the uniqueness
@@ -999,7 +985,7 @@ const STARTER_STEPS: StarterStep[] = [
   // Several top-level sections (each its own root: parent = itself) — the workflow's
   // identity lives in the "Workflow Name" config value, not in a single wrapper step.
   { step: "Understand the layout", parent: "Understand the layout", notes: "This sheet is both the guide and a working example — edit it freely, then run the script.", done: false, depth: 0 },
-  { step: "The top block sets options: Workflow Name, Published Sheet, Action", parent: "Understand the layout", notes: "Options are read by their label, so the block can move.", done: false, depth: 1 },
+  { step: "The top block sets options: Workflow Name, Published Sheet, Action, Numbered", parent: "Understand the layout", notes: "Options are read by their label, so the block can move.", done: false, depth: 1 },
   { step: "This table is your workflow: one row per step", parent: "Understand the layout", notes: "", done: false, depth: 1 },
   { step: "Each step names its Parent Step to build the hierarchy", parent: "Understand the layout", notes: "A step whose parent is itself (or blank) is top-level.", done: false, depth: 1 },
   { step: "Hierarchy is data, not indentation", parent: "Each step names its Parent Step to build the hierarchy", notes: "Rows can start in any order — Organize reflows them.", done: false, depth: 2 },
@@ -1014,11 +1000,11 @@ const STARTER_STEPS: StarterStep[] = [
   { step: "Tick Done when a step is complete", parent: "Edit your workflow", notes: "", done: true, depth: 1 },
 
   { step: "Organize the sheet", parent: "Organize the sheet", notes: "", done: false, depth: 0 },
-  { step: "Set Action to Organize, then run", parent: "Organize the sheet", notes: "Rows sort into an indented outline; blank rows are removed.", done: false, depth: 1 },
+  { step: "Set Action to Organize, then run", parent: "Organize the sheet", notes: "Rows sort into an indented outline; blank rows are removed. With Numbered on, it also fills the No. column.", done: false, depth: 1 },
   { step: "Add new steps at the bottom, then Organize again", parent: "Organize the sheet", notes: "They file themselves under their parent.", done: false, depth: 1 },
 
   { step: "Number the steps", parent: "Number the steps", notes: "", done: false, depth: 0 },
-  { step: "Set Action to Renumber, then run", parent: "Number the steps", notes: "Fills the No. column with outline numbers (1, 1.1, 1.2 …). Un-number clears them.", done: false, depth: 1 },
+  { step: "Set Numbered to true, then Organize", parent: "Number the steps", notes: "Organize fills the No. column with outline numbers (1, 1.1, 1.2 …). Set Numbered to false and Organize to clear them.", done: false, depth: 1 },
 
   { step: "Publish a checklist", parent: "Publish a checklist", notes: "", done: false, depth: 0 },
   { step: "Set Published Sheet to a name for the output", parent: "Publish a checklist", notes: "", done: false, depth: 1 },
@@ -1026,7 +1012,7 @@ const STARTER_STEPS: StarterStep[] = [
   { step: "Publish mirrors this sheet and never edits your source", parent: "Publish a checklist", notes: "", done: false, depth: 1 },
 
   // A self-contained worked example — a mini project nested several levels deep, so a new
-  // user can see at a glance what the outline (and Renumber's 1 / 1.1 / 1.1.1 …) looks like.
+  // user can see at a glance what the outline (and its 1 / 1.1 / 1.1.1 … numbers) looks like.
   { step: "See it nest: a worked example", parent: "See it nest: a worked example", notes: "A mini project below, indented by depth so the structure reads at a glance.", done: false, depth: 0 },
   { step: "Plan the launch", parent: "See it nest: a worked example", notes: "", done: false, depth: 1 },
   { step: "Define the scope", parent: "Plan the launch", notes: "", done: false, depth: 2 },
@@ -1054,7 +1040,7 @@ function scaffoldStarterSheet(sheet: ExcelScript.Worksheet): void {
 
   // Config block (standard layout): a grey "Property | Property Value" header
   // filled across the table width (A:E), then label | value pairs read by label —
-  // Workflow Name (row 2), Published Sheet (row 3), Action (row 4).
+  // Workflow Name (row 2), Published Sheet (row 3), Action (row 4), Numbered (row 5).
   sheet.getRangeByIndexes(0, 0, 1, TABLE_WIDTH).getFormat().getFill().setColor(HEADER_FILL);
   const configHeader = sheet.getRangeByIndexes(0, 0, 1, 2);
   configHeader.setValues([["Property", "Property Value"]]);
@@ -1063,20 +1049,22 @@ function scaffoldStarterSheet(sheet: ExcelScript.Worksheet): void {
   const ROW_NAME = 1;
   const ROW_PUBLISH = 2;
   const ROW_ACTION = 3;
+  const ROW_NUMBERED = 4;
   sheet.getRangeByIndexes(ROW_NAME, 0, 1, 2).setValues([[WORKFLOW_NAME_LABEL, "Workflow Engine: Quick Start"]]);
   sheet.getRangeByIndexes(ROW_PUBLISH, 0, 1, 2).setValues([[PUBLISHED_SHEET_LABEL, "Workflow Checklist"]]);
   sheet.getRangeByIndexes(ROW_ACTION, 0, 1, 2).setValues([[ACTION_LABEL, ACTION_OPTIONS[0]]]);
-  for (const labelRow of [ROW_NAME, ROW_PUBLISH, ROW_ACTION]) {
+  sheet.getRangeByIndexes(ROW_NUMBERED, 0, 1, 2).setValues([[NUMBERED_LABEL, "true"]]);
+  for (const labelRow of [ROW_NAME, ROW_PUBLISH, ROW_ACTION, ROW_NUMBERED]) {
     sheet.getRangeByIndexes(labelRow, 0, 1, 1).getFormat().getFont().setBold(true); // bold labels
   }
 
   // Self-healing Action dropdown on its value cell (B4), via the shared helper.
   applyActionDropdown(sheet.getRangeByIndexes(ROW_ACTION, 1, 1, 1));
 
-  // Step table header (blank row 5 separates it from the config block), grey A:E.
-  // The empty "No." column is here so Renumber works on the starter sheet right away.
+  // Step table header (blank row 6 separates it from the config block), grey A:E.
+  // The empty "No." column is here so Organize can number the starter sheet right away.
   const headers = [STEP_HEADER, PARENT_HEADER, NOTES_HEADER, DONE_HEADER, NUMBER_HEADER];
-  const headerRow = ROW_ACTION + 2; // row 6 (0-based index 5)
+  const headerRow = ROW_NUMBERED + 2; // row 7 (0-based index 6)
   const tableHeader = sheet.getRangeByIndexes(headerRow, 0, 1, headers.length);
   tableHeader.setValues([headers]);
   tableHeader.getFormat().getFont().setBold(true);
@@ -1113,5 +1101,5 @@ function scaffoldStarterSheet(sheet: ExcelScript.Worksheet): void {
   sheet.getRange("B:B").getFormat().setColumnWidth(230);
   sheet.getRange("C:C").getFormat().setColumnWidth(320);
   sheet.getRange("D:D").getFormat().setColumnWidth(60);
-  sheet.getRange("E:E").getFormat().setColumnWidth(50); // No. — filled by Renumber
+  sheet.getRange("E:E").getFormat().setColumnWidth(50); // No. — filled by Organize when Numbered is on
 }

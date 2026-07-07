@@ -32,6 +32,9 @@ the alternatives (pandoc, a Word-side macro, Power Automate).
   Title + TOC stand alone on page 1). Set via the Heading 1 style's "page break before"
   property, so it reflows cleanly. Toggle with the `PAGE_BREAK_BEFORE_H1` constant at the
   top of the macro.
+- **Page numbers** — a centered page number in the footer of every page. It's a Word `PAGE`
+  field, so it corresponds to the Table of Contents' page numbers (both paginate the same
+  document). Toggle with the `PAGE_NUMBERS` constant at the top of the macro.
 
 ## How to run it
 
@@ -49,15 +52,18 @@ are reported in a message box.
 
 The macro can't call the engine's TypeScript, so it reads structure straight from the
 **`No.` column**: heading depth is the dot-count of the number (`2.3.1` → depth 3) and
-order is the outline order of the numbers. So **run `Renumber` first.**
+order is the outline order of the numbers. So **number the tree first** — set the engine's
+`Numbered` config option to `true` and run **Organize**. (Numbering is folded into Organize;
+there's no separate `Renumber` action anymore.)
 
-Export **refuses and instructs** — it never renumbers for you (that would mutate the source
-as a side effect of a derived output). It stops with a specific message when:
+Export **refuses and instructs** — it never numbers for you (that would mutate the source as
+a side effect of a derived output). It stops with a specific message when:
 
-- there's **no `No.` column** → "Add a 'No.' column and run Renumber";
-- a step row is **blank in `No.`** → "Some steps aren't numbered — run Renumber";
-- the numbers are **stale** (a child whose parent number is missing) → "Numbering is out of
-  date — run Renumber".
+- there's **no `No.` column** → add one, then run Organize with `Numbered = true`;
+- a step row is **blank in `No.`** → some steps aren't numbered — run Organize with
+  `Numbered = true`;
+- the numbers are **stale** (a child whose parent number is missing) → the numbering is out
+  of date — run Organize with `Numbered = true`.
 
 ## Images — the `![[key]]` scheme
 
@@ -69,6 +75,20 @@ never by position.** No registry table — the image's *name is the key*.
 | Property | Property Value |
 |---|---|
 | `Images Sheet` | `Screenshots` |
+
+The `Images Sheet` row is **repeatable** — add one row per sheet to group your
+screenshots across several sheets (e.g. one per feature area), and the export
+pools the shapes from all of them into a single key map:
+
+| Property | Property Value |
+|---|---|
+| `Images Sheet` | `Login Screens` |
+| `Images Sheet` | `Admin Screens` |
+
+Keep keys unique across *all* the listed sheets. If the same key appears on more
+than one, the sheet listed **first** wins (a soft, non-crashing resolution — same
+discipline as the other reference tokens). A named sheet that doesn't exist is
+skipped, so its `![[key]]` tokens simply fall to the leave-verbatim placeholder.
 
 **2. Name each screenshot.** Give each image a stable key via the **Name Box**:
 
@@ -129,10 +149,10 @@ step's heading and displays its **current number and name** — e.g. `2.3.3 Conf
 (matching the heading, so the reader knows both *where* and *what*). You reference by the step's
 name — its stable identity — never by the number, because the number is the one thing that moves
 when you restructure. Both the number and the jump target are recomputed on every export, so the
-citation can never go stale: restructure, re-`Renumber`, re-export, and it updates automatically.
+citation can never go stale: restructure, re-Organize (with `Numbered = true`), re-export, and it updates automatically.
 
 This is **Word-export only** — the source sheet keeps the durable `[[name]]` token; only the
-generated document shows the live number. It does nothing in Excel (Organize / Renumber / Publish
+generated document shows the live number. It does nothing in Excel (Organize / Publish
 never touch it), which is the point: a cross-reference is only useful in a rendered document.
 
 **Resolution rule — resolve if found, else leave verbatim.** `[[name]]` → a hyperlink to the
@@ -142,6 +162,64 @@ lives on another sheet). Matching is case-insensitive. Same discipline as the im
 
 Under the hood, each heading is bookmarked as it's written and the link is a Word hyperlink to
 that bookmark (Ctrl+Click to follow, like the TOC).
+
+## Notes formatting — lightweight markdown
+
+`Notes` are authored as **plain text** and support a small set of **markdown-style markup**, which
+the same scanner that resolves `![[ ]]` / `[[ ]]` interprets on export. Because it's all just text
+in the cell, it has **no length limit** (unlike native cell formatting — see the note at the end).
+In-cell **line breaks** (Alt+Enter) become paragraphs.
+
+**Inline** (works anywhere, including inside a list or table cell):
+
+| You type | Word shows |
+|---|---|
+| `**bold**` | **bold** |
+| `*italic*` | *italic* |
+| `` `code` `` | monospace `code` |
+| `[text](https://example.com)` | clickable **text** → the URL |
+
+A marker that doesn't close, or is wrapped in spaces (`a * b`), is left as literal text — so the
+occasional stray `*` won't mangle a line.
+
+A `[text](url)` becomes a Word hyperlink — the URL can be a web address (`https://…`) or a file
+path (`S:\budget\…`). This is for **external** targets; to link *another step* in the document, use
+the `[[step name]]` cross-reference described below. Bracketed text without a following `(url)` —
+e.g. `[draft]` — is left as literal text, so ordinary square brackets are safe.
+
+**Lists** — start a line with `- ` for a bullet or `N. ` (e.g. `1. `) for a numbered item.
+**Indent 2 spaces per sub-level** to nest (up to 5 levels deep):
+
+```
+- first point
+  - sub-point
+    - sub-sub-point
+- second point
+1. step one
+2. step two
+```
+
+(Bullets nest cleanly; numbered sub-lists indent and restart per level — they don't auto-produce
+`1.1`-style hierarchical numbers.)
+
+**Tables** — a run of **2 or more lines starting with `|`**. The **first row is the header**; cells
+are split on `|` and rendered inline (so `**bold**` / `[[link]]` work in a cell):
+
+```
+| Phase  | Owner |
+| Draft  | Alice |
+| Review | Bob   |
+```
+
+The GFM `|---|---|` separator row is **optional**: you don't need it, but if you paste in a standard
+markdown table that has one, it's tolerated and skipped — so both forms work. There's no alignment
+syntax and no `\|` escaping (keep literal pipes out of table cells).
+
+> **Note — native Excel formatting isn't read.** Bold/italic applied with Excel's *toolbar* (rather
+> than typed as `**markers**`) is **not** carried into Word. Reading per-character cell formatting
+> (`Range.Characters(...).Font`) is unreliable past ~255 characters, so the markup above is the
+> dependable, length-agnostic path instead. (A full-fidelity route — parsing Excel's clipboard HTML
+> — is possible but deliberately not built; see `../ROADMAP.md`.)
 
 ## Caveats / known rough edges
 

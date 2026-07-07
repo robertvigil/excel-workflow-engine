@@ -16,11 +16,13 @@ The engine takes care of the structure:
 - **Organize** — sorts the steps into a depth-first **indented outline** and removes
   blank rows. Everything (values, formatting, checkboxes) stays attached to its row.
   Add new steps anywhere, in any order, and Organize files them under their parent.
-- **Renumber** — fills a `No.` column with hierarchical outline numbers (`1`, `1.1`,
-  `1.2`, `2`, …) from the tree, so the sequence is always correct no matter how you edit.
-  **Un-number** clears them. (Numbers live in their own column, never in the step name.)
-  Add a `No.` column yourself first — same rules as any [custom column](#adding-your-own-columns);
-  Renumber tells you if it's missing.
+  With the **`Numbered`** option set to `true`, the *same* Organize run also fills a
+  `No.` column with hierarchical outline numbers (`1`, `1.1`, `1.2`, `2`, …) from the
+  tree, so the sequence is always correct no matter how you edit; set it to `false` (or
+  leave the row off) and Organize clears that column instead. (Numbers live in their own
+  column, never in the step name.) Add a `No.` column yourself first — same rules as any
+  [custom column](#adding-your-own-columns); with `Numbered` on, Organize tells you if
+  it's missing.
 - **Publish** — compiles the workflow into a clean **checklist** on a separate sheet,
   mirroring your source's own formatting *and column layout*: columns appear in the order
   you authored them (the `Parent Step` column is dropped), so any [custom columns](#adding-your-own-columns)
@@ -38,7 +40,8 @@ The engine takes care of the structure:
 |---|---|
 | `Workflow Name` | Title shown on the published checklist |
 | `Published Sheet` | Name of the sheet **Publish** creates (becomes a clickable link once it exists) |
-| `Action` | `Organize`, `Publish`, `Renumber`, or `Un-number` — an in-cell dropdown |
+| `Action` | `Organize` or `Publish` — an in-cell dropdown |
+| `Numbered` | `true` or `false`, typed in by hand (not a dropdown, so it sticks). When `true`, **Organize** also fills the `No.` column with outline numbers; when `false` or absent, Organize clears it. |
 | `Linked Sheet` | Another sheet to keep step names unique against (repeatable — one row per sheet). The value becomes a clickable link to that sheet. |
 
 **Working on a branch in its own sheet.** Add a `Linked Sheet` row (you can add several)
